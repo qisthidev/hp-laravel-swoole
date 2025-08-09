@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Laravel Octane Series: Advanced Topics</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-light.min.css" integrity="sha512-0hNBmqx8uoWaaFWP3QmZqyyw2z4v8pU/3NsKHnqHnJ9tKa5fKvUw3uAHmUsc9IGxKs2gq0v6NQK+mb8UgF4KRg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha512-4p8i7m5Bv71pT6vB6Qz/5mB8j8EgaCm4bI5hJQ4ii7p0N6H7khYCnT2gqF7yNzW3f0F4qGvU1f6aR9pVZpA9aQ==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <style>
+    body { padding: 2rem; display: flex; justify-content: center; }
+    .markdown-body { max-width: 920px; }
+    pre code { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <article class="markdown-body" id="md-root">
+<div><h1>Laravel Octane Series: Advanced Topics</h1>
+<p>This repository contains detailed, step-by-step articles for a Laravel Octane series tailored for junior developers and college students. The focus is on practical, production-grade skills with deep explanations.</p>
+<p>Articles in this batch:</p>
+<ul>
+<li>Article 7: Building a Real-Time Chat Application with Laravel &amp; WebSockets</li>
+<li>Article 8: Advanced Memory Management &amp; Debugging in a Stateful World (Octane)</li>
+<li>Article 9: Scaling Your Octane Application: Load Balancing and Multi-Server Setups</li>
+</ul>
+<p>Navigate directly to articles:</p>
+<ul>
+<li><a href="./articles/07-real-time-chat-laravel-websockets.md">Article 7</a></li>
+<li><a href="./articles/08-advanced-memory-management-octane.md">Article 8</a></li>
+<li><a href="./articles/09-scaling-octane-load-balancing.md">Article 9</a></li>
+</ul>
+<p>Who this is for</p>
+<ul>
+<li>Junior engineers and students who want to build real features and understand performance at a deeper level</li>
+<li>Practitioners adopting Laravel Octane at work</li>
+</ul>
+<p>Conventions</p>
+<ul>
+<li>Laravel 11.x used throughout unless noted</li>
+<li>Examples assume Linux/macOS and Docker (optional) or local PHP 8.2+</li>
+<li>Code is written with explicit, descriptive names and guard clauses for readability</li>
+</ul></div>
+  </article>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha512-mZ2StmJDLPz7tqP3QGq8cH9K0l3iU3JfVZg6dFfQz0f5TtGP2sFZp3Hf3jQn5vMqQF0z8X5n0n1mV0Vx9gQXhA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script>document.querySelectorAll('pre code').forEach(el => { try { hljs.highlightElement(el); } catch(e){} });</script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    // Transform code blocks with language-mermaid into mermaid divs
+    const blocks = Array.from(document.querySelectorAll('pre code.language-mermaid'));
+    blocks.forEach(code => {
+      const pre = code.parentElement;
+      const container = document.createElement('div');
+      container.className = 'mermaid';
+      container.textContent = code.textContent;
+      pre.replaceWith(container);
+    });
+    mermaid.initialize({ startOnLoad: true, securityLevel: 'loose', theme: 'default' });
+  </script>
+</body>
+</html>
