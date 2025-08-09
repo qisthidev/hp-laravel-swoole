@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Article 8 — Advanced Memory Management __TITLE__ Debugging in a Stateful World (Octane)</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-light.min.css" integrity="sha512-0hNBmqx8uoWaaFWP3QmZqyyw2z4v8pU/3NsKHnqHnJ9tKa5fKvUw3uAHmUsc9IGxKs2gq0v6NQK+mb8UgF4KRg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha512-4p8i7m5Bv71pT6vB6Qz/5mB8j8EgaCm4bI5hJQ4ii7p0N6H7khYCnT2gqF7yNzW3f0F4qGvU1f6aR9pVZpA9aQ==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <style>
+    body { padding: 2rem; display: flex; justify-content: center; }
+    .markdown-body { max-width: 920px; }
+    pre code { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <article class="markdown-body" id="md-root">
+<div><h1>Article 8 — Advanced Memory Management &amp; Debugging in a Stateful World (Octane)</h1>
+<p>Outcome: Become an Octane expert at avoiding and finding memory leaks. Understand worker lifecycles, common pitfalls, safe patterns, and how to profile and fix leaks.</p>
+<h2>Why Memory Management Matters in Octane</h2>
+<p>Laravel Octane runs long-lived workers. Anything you put into global/static state or application singletons can persist across requests. That yields speed, but also memory leaks and cross-request contamination if misused.</p>
+<h2>Key Concepts</h2>
+<ul>
+<li>Request vs Worker lifetime: Request data must not leak into worker context</li>
+<li>Container bindings: <code>singleton</code>, <code>scoped</code>, <code>bind</code></li>
+<li>Resetting state: Octane can purge/resume workers, but it’s your job to keep state disciplined</li>
+<li>Opcache vs memory pool: Opcache caches code, not request data</li>
+</ul>
+<h2>Rules of Thumb</h2>
+<ul>
+<li>Do not cache Request/User/Response instances in <code>singleton</code> services</li>
+<li>Prefer <code>scoped()</code> bindings for request-bound services</li>
+<li>Clear large in-memory caches periodically or use Redis</li>
+<li>Avoid unbounded arrays and static caches that grow forever</li>
+<li>Use streaming/chunked processing for large datasets</li>
+</ul>
+<h2>Worker Lifecycle Cheatsheet</h2>
+<ul>
+<li>Start: container is booted once</li>
+<li>Handle requests: same worker handles many requests</li>
+<li>Recycle: based on <code>--max-requests</code>, memory thresholds, or manual reload</li>
+</ul>
+<h2>Detecting Leaks Fast</h2>
+<ul>
+<li>Watch memory in production: process RSS and PHP memory usage</li>
+<li>Use Octane commands: <code>php artisan octane:status</code></li>
+<li>Add metrics: log peak memory per request and aggregate by route</li>
+</ul>
+<pre><code class="language-php">// app/Http/Middleware/TrackMemory.php
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+
+class TrackMemory
+{
+    public function handle(Request $request, Closure $next)
+    {
+        $before = memory_get_usage(true);
+        $peakBefore = memory_get_peak_usage(true);
+        $response = $next($request);
+        $after = memory_get_usage(true);
+        $peakAfter = memory_get_peak_usage(true);
+        Log::info(&#39;memory&#39;, [
+            &#39;route&#39; =&gt; $request-&gt;path(),
+            &#39;before&#39; =&gt; $before,
+            &#39;after&#39; =&gt; $after,
+            &#39;delta&#39; =&gt; $after - $before,
+            &#39;peak_delta&#39; =&gt; $peakAfter - $peakBefore,
+        ]);
+        return $response;
+    }
+}
+</code></pre>
+<p>Register this middleware temporarily for suspect routes.</p>
+<h2>Classic Leak Patterns (With Fixes)</h2>
+<h3>1) Accidental global cache growth</h3>
+<pre><code class="language-php">// Bad: grows forever across requests
+class UserCache {
+    public static array $byId = [];
+}
+
+// Controller
+UserCache::$byId[$userId] = $user; // never cleared
+</code></pre>
+<p>Fix: Use Redis or LRU cache with a hard cap, or scope to request.</p>
+<h3>2) Singletons holding request objects</h3>
+<pre><code class="language-php">// Bad
+$this-&gt;app-&gt;singleton(ReportGenerator::class, function ($app) {
+    return new ReportGenerator(request()); // captures Request forever
+});
+</code></pre>
+<p>Fix: <code>scoped()</code> or inject only the data needed.</p>
+<pre><code class="language-php">$this-&gt;app-&gt;scoped(ReportGenerator::class, function ($app) {
+    return new ReportGenerator(request()-&gt;user()-&gt;id);
+});
+</code></pre>
+<h3>3) Event listeners capturing heavy closures</h3>
+<pre><code class="language-php">// Bad: closure captures large arrays from first request
+Event::listen(&#39;data.ready&#39;, function () use ($hugeArray) { /* ... */ });
+</code></pre>
+<p>Fix: Extract to invokable listener class; do not capture large references.</p>
+<h3>4) Static properties as caches without eviction</h3>
+<p>Fix: Either set a max size and eviction policy or avoid entirely.</p>
+<h3>5) Large collections kept in memory</h3>
+<p>Fix: use chunking/streaming</p>
+<pre><code class="language-php">User::query()-&gt;chunk(1000, function ($chunk) { /* process */ });
+</code></pre>
+<h2>Octane-Specific Tools</h2>
+<ul>
+<li><code>--max-requests=500</code> or similar to recycle workers</li>
+<li>Memory limit guards via Supervisor/systemd (kill and restart on overuse)</li>
+<li><code>Octane::purge()</code> to drop singleton state between jobs (use sparingly)</li>
+<li><code>Octane::concurrently()</code> for parallel I/O without growing memory</li>
+</ul>
+<pre><code class="language-php">use Laravel\Octane\Facades\Octane;
+
+[$user, $orders, $invoices] = Octane::concurrently([
+    fn () =&gt; User::find($id),
+    fn () =&gt; Order::where(&#39;user_id&#39;, $id)-&gt;latest()-&gt;limit(10)-&gt;get(),
+    fn () =&gt; Invoice::where(&#39;user_id&#39;, $id)-&gt;latest()-&gt;limit(10)-&gt;get(),
+]);
+</code></pre>
+<h2>Profiling and Debugging</h2>
+<ul>
+<li>Local profiling: Xdebug (profile mode), XHProf/Tideways, Blackfire</li>
+<li>Production-safe sampling: OpenTelemetry exporters, StatsD, custom logs</li>
+</ul>
+<p>Xdebug quickstart (local):</p>
+<ul>
+<li>Enable <code>xdebug.mode=profile</code></li>
+<li>Run a few requests; open output in QCacheGrind/KCacheGrind</li>
+<li>Look for high allocation paths and long-lived arrays</li>
+</ul>
+<p>Blackfire/Tideways: instrument selected routes under load; diff before/after changes.</p>
+<h2>Safe Service Design Patterns</h2>
+<ul>
+<li>Constructor accepts IDs/scalars, not Request/models</li>
+<li>Idempotent services that do not store internal mutable state between calls</li>
+<li>Short-lived caches with explicit <code>clear()</code> and max size</li>
+<li>Use <code>-&gt;scoped()</code> bindings for request-lifetime services</li>
+</ul>
+<pre><code class="language-php">// AppServiceProvider
+public function register(): void
+{
+    $this-&gt;app-&gt;scoped(\App\Services\ReportGenerator::class, function ($app) {
+        return new \App\Services\ReportGenerator(auth()-&gt;id());
+    });
+}
+</code></pre>
+<h2>Guardrails and CI Checks</h2>
+<ul>
+<li>Static analysis to flag <code>request()</code> usage inside singletons</li>
+<li>Unit tests that simulate multiple requests on the same service instance</li>
+<li>A smoke test that loops a route 5k times and asserts memory stays bounded</li>
+</ul>
+<pre><code class="language-php">public function test_memory_does_not_grow_unbounded(): void
+{
+    $memory = 0;
+    for ($i = 0; $i &lt; 5000; $i++) {
+        $this-&gt;get(&#39;/reports&#39;);
+        if ($i % 100 === 0) {
+            $current = memory_get_usage(true);
+            $this-&gt;assertLessThan($memory + 5 * 1024 * 1024, $current); // +5MB tolerance
+            $memory = $current;
+        }
+    }
+}
+</code></pre>
+<h2>Operations Playbook</h2>
+<ul>
+<li>Start workers with conservative <code>--max-requests</code></li>
+<li>Monitor RSS and restart when exceeding threshold</li>
+<li>Use rolling restarts to avoid traffic drops</li>
+<li>Keep per-worker memory headroom for bursts</li>
+</ul>
+<p>Supervisor example:</p>
+<pre><code class="language-ini">[program:octane]
+command=php artisan octane:start --server=swoole --workers=8 --task-workers=8 --max-requests=500
+numprocs=1
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/octane.out.log
+stderr_logfile=/var/log/octane.err.log
+stopwaitsecs=60
+</code></pre>
+<h2>Checklist (Paste into PRs)</h2>
+<ul>
+<li>No request objects in singletons</li>
+<li>No static caches without caps/eviction</li>
+<li>Big arrays processed with chunking/streams</li>
+<li>Memory tracked per route</li>
+<li>Workers recycled with sensible limits</li>
+</ul>
+<h2>Commit-by-Commit Teaching Plan</h2>
+<ul>
+<li>Commit 1: Add middleware to log memory usage per request; docs on reading logs</li>
+<li>Commit 2: Demonstrate a leak with a static cache; show growth graphs</li>
+<li>Commit 3: Refactor to <code>scoped()</code> bindings and external cache (Redis)</li>
+<li>Commit 4: Add profiling setup (Xdebug/Blackfire) with screenshots and steps</li>
+<li>Commit 5: Introduce CI smoke test to guard against regressions</li>
+<li>Commit 6: Add Supervisor/systemd configs and operational guidance</li>
+</ul>
+<p>Each commit message should include “What changed”, “Why”, “How to verify”, “Rollout/rollback plan”.</p>
+<h2>Diagrams</h2>
+<p><img src="../assets/article-08/worker-lifecycle.png" alt="Worker lifecycle"></p>
+<pre><code class="language-mermaid">flowchart TD
+  A[Worker start] --&gt; B[Container boot]
+  B --&gt; C{Handle request N}
+  C --&gt;|process| D[Respond]
+  D --&gt; E{Recycle conditions?\nmax-requests or memory}
+  E --&gt;|No| C
+  E --&gt;|Yes| F[Worker recycle]
+  F --&gt; A
+</code></pre></div>
+  </article>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha512-mZ2StmJDLPz7tqP3QGq8cH9K0l3iU3JfVZg6dFfQz0f5TtGP2sFZp3Hf3jQn5vMqQF0z8X5n0n1mV0Vx9gQXhA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script>document.querySelectorAll('pre code').forEach(el => { try { hljs.highlightElement(el); } catch(e){} });</script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    // Transform code blocks with language-mermaid into mermaid divs
+    const blocks = Array.from(document.querySelectorAll('pre code.language-mermaid'));
+    blocks.forEach(code => {
+      const pre = code.parentElement;
+      const container = document.createElement('div');
+      container.className = 'mermaid';
+      container.textContent = code.textContent;
+      pre.replaceWith(container);
+    });
+    mermaid.initialize({ startOnLoad: true, securityLevel: 'loose', theme: 'default' });
+  </script>
+</body>
+</html>

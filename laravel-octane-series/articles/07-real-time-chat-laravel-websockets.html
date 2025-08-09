@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Article 7 — Building a Real-Time Chat Application with Laravel __TITLE__ WebSockets</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-light.min.css" integrity="sha512-0hNBmqx8uoWaaFWP3QmZqyyw2z4v8pU/3NsKHnqHnJ9tKa5fKvUw3uAHmUsc9IGxKs2gq0v6NQK+mb8UgF4KRg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha512-4p8i7m5Bv71pT6vB6Qz/5mB8j8EgaCm4bI5hJQ4ii7p0N6H7khYCnT2gqF7yNzW3f0F4qGvU1f6aR9pVZpA9aQ==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <style>
+    body { padding: 2rem; display: flex; justify-content: center; }
+    .markdown-body { max-width: 920px; }
+    pre code { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <article class="markdown-body" id="md-root">
+<div><h1>Article 7 — Building a Real-Time Chat Application with Laravel &amp; WebSockets</h1>
+<p>Outcome: Build a usable real-time chat with presence, typing indicators, and read receipts using Laravel 11, Reverb (first‑party WebSockets), and Laravel Echo.</p>
+<h2>What You’ll Build</h2>
+<p>A simple, multi-room chat where authenticated users can join a room, see who’s online, send messages instantly, and view message read status. This demonstrates persistent WebSocket connections and event-driven UI updates.</p>
+<h2>Prerequisites</h2>
+<ul>
+<li>PHP 8.2+</li>
+<li>Composer</li>
+<li>Node.js 18+</li>
+<li>Redis 6+ (for broadcasting/backplane and session/cache)</li>
+<li>Laravel 11.x</li>
+<li>Optional: Docker Desktop for local Redis</li>
+</ul>
+<h2>Technology Choices</h2>
+<ul>
+<li><strong>Laravel Reverb</strong>: First-party WebSockets server introduced by Laravel. Production-ready and tightly integrated.</li>
+<li><strong>Laravel Echo</strong>: Client library to subscribe to channels and listen to broadcast events.</li>
+<li><strong>Redis</strong>: Pub/Sub backplane so multiple app instances share WebSocket events.</li>
+<li><strong>Octane</strong> (optional here): Improves throughput; we note specific considerations.</li>
+</ul>
+<h2>Architecture Overview</h2>
+<ul>
+<li>HTTP requests handle authentication, room navigation, and message posting endpoints.</li>
+<li>Broadcastable events are emitted on message creation, typing, and read receipts.</li>
+<li>Reverb pushes these events to browser clients subscribed via Echo.</li>
+</ul>
+<p>High-level event flow</p>
+<ol>
+<li>User posts message via HTTP endpoint</li>
+<li>Controller persists message</li>
+<li><code>MessageSent</code> event is broadcast to <code>presence-chat.{roomId}</code></li>
+<li>Echo client receives event and updates UI instantly</li>
+</ol>
+<h2>Project Setup</h2>
+<pre><code class="language-bash"># Create a new app
+composer create-project laravel/laravel chat-app
+cd chat-app
+
+# Install Reverb (Laravel&#39;s WebSocket server)
+php artisan install:broadcasting
+php artisan reverb:install --force
+
+# Install frontend dependencies
+npm install
+
+# Start Redis (local)
+docker run -p 6379:6379 --name redis -d redis:7-alpine || true
+
+# Copy .env
+cp .env.example .env
+php artisan key:generate
+</code></pre>
+<p>Update <code>.env</code> for broadcasting with Reverb and Redis:</p>
+<pre><code class="language-env">BROADCAST_CONNECTION=reverb
+CACHE_STORE=redis
+QUEUE_CONNECTION=redis
+SESSION_DRIVER=redis
+
+REVERB_APP_ID=local
+REVERB_APP_KEY=local
+REVERB_APP_SECRET=local
+REVERB_HOST=127.0.0.1
+REVERB_PORT=8080
+REVERB_SCHEME=http
+REVERB_SERVER_HOST=127.0.0.1
+REVERB_SERVER_PORT=8080
+REVERB_REDIS_TLS=false
+</code></pre>
+<p>Start services during development in separate terminals:</p>
+<pre><code class="language-bash">php artisan reverb:start
+php artisan serve
+npm run dev
+</code></pre>
+<h2>Domain Modeling</h2>
+<p>We will keep it minimal but realistic:</p>
+<ul>
+<li><code>rooms</code> table for chat rooms</li>
+<li><code>messages</code> table for chat messages</li>
+<li><code>ChatRoom</code>, <code>ChatMessage</code> models</li>
+<li>Events: <code>MessageSent</code>, <code>UserTyping</code>, <code>MessageRead</code></li>
+<li>Broadcast channels: <code>presence-chat.{roomId}</code></li>
+</ul>
+<h3>Migrations</h3>
+<pre><code class="language-php">// database/migrations/2024_01_01_000000_create_rooms_table.php
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+    public function up(): void {
+        Schema::create(&#39;rooms&#39;, function (Blueprint $table) {
+            $table-&gt;id();
+            $table-&gt;string(&#39;name&#39;);
+            $table-&gt;timestamps();
+        });
+    }
+    public function down(): void {
+        Schema::dropIfExists(&#39;rooms&#39;);
+    }
+};
+</code></pre>
+<pre><code class="language-php">// database/migrations/2024_01_01_000001_create_messages_table.php
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+    public function up(): void {
+        Schema::create(&#39;messages&#39;, function (Blueprint $table) {
+            $table-&gt;id();
+            $table-&gt;foreignId(&#39;room_id&#39;)-&gt;constrained(&#39;rooms&#39;)-&gt;cascadeOnDelete();
+            $table-&gt;foreignId(&#39;user_id&#39;)-&gt;constrained(&#39;users&#39;)-&gt;cascadeOnDelete();
+            $table-&gt;text(&#39;body&#39;);
+            $table-&gt;timestamp(&#39;read_at&#39;)-&gt;nullable();
+            $table-&gt;timestamps();
+        });
+    }
+    public function down(): void {
+        Schema::dropIfExists(&#39;messages&#39;);
+    }
+};
+</code></pre>
+<h3>Models</h3>
+<pre><code class="language-php">// app/Models/ChatRoom.php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class ChatRoom extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [&#39;name&#39;];
+
+    public function messages(): HasMany
+    {
+        return $this-&gt;hasMany(ChatMessage::class, &#39;room_id&#39;);
+    }
+}
+</code></pre>
+<pre><code class="language-php">// app/Models/ChatMessage.php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class ChatMessage extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [&#39;room_id&#39;, &#39;user_id&#39;, &#39;body&#39;, &#39;read_at&#39;];
+
+    public function room(): BelongsTo
+    {
+        return $this-&gt;belongsTo(ChatRoom::class, &#39;room_id&#39;);
+    }
+
+    public function user(): BelongsTo
+    {
+        return $this-&gt;belongsTo(User::class);
+    }
+}
+</code></pre>
+<h2>Broadcasting Events</h2>
+<pre><code class="language-php">// app/Events/MessageSent.php
+namespace App\Events;
+
+use App\Models\ChatMessage;
+use Illuminate\Broadcasting\Channel;
+use Illuminate\Broadcasting\InteractsWithSockets;
+use Illuminate\Broadcasting\PresenceChannel;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Queue\SerializesModels;
+
+class MessageSent implements ShouldBroadcast
+{
+    use InteractsWithSockets, SerializesModels;
+
+    public function __construct(public ChatMessage $message) {}
+
+    public function broadcastOn(): Channel
+    {
+        return new PresenceChannel(&#39;chat.&#39; . $this-&gt;message-&gt;room_id);
+    }
+
+    public function broadcastAs(): string
+    {
+        return &#39;message.sent&#39;;
+    }
+
+    public function broadcastWith(): array
+    {
+        return [
+            &#39;id&#39; =&gt; $this-&gt;message-&gt;id,
+            &#39;room_id&#39; =&gt; $this-&gt;message-&gt;room_id,
+            &#39;user&#39; =&gt; [
+                &#39;id&#39; =&gt; $this-&gt;message-&gt;user-&gt;id,
+                &#39;name&#39; =&gt; $this-&gt;message-&gt;user-&gt;name,
+            ],
+            &#39;body&#39; =&gt; $this-&gt;message-&gt;body,
+            &#39;created_at&#39; =&gt; $this-&gt;message-&gt;created_at-&gt;toIso8601String(),
+        ];
+    }
+}
+</code></pre>
+<p>Typing and read events (optional, analogous):</p>
+<pre><code class="language-php">// app/Events/UserTyping.php
+namespace App\Events;
+
+use Illuminate\Broadcasting\InteractsWithSockets;
+use Illuminate\Broadcasting\PresenceChannel;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Queue\SerializesModels;
+
+class UserTyping implements ShouldBroadcast
+{
+    use InteractsWithSockets, SerializesModels;
+
+    public function __construct(public int $roomId, public int $userId, public bool $isTyping) {}
+
+    public function broadcastOn(): PresenceChannel { return new PresenceChannel(&#39;chat.&#39; . $this-&gt;roomId); }
+    public function broadcastAs(): string { return &#39;user.typing&#39;; }
+    public function broadcastWith(): array { return [&#39;user_id&#39; =&gt; $this-&gt;userId, &#39;is_typing&#39; =&gt; $this-&gt;isTyping]; }
+}
+</code></pre>
+<pre><code class="language-php">// app/Events/MessageRead.php
+namespace App\Events;
+
+use Illuminate\Broadcasting\InteractsWithSockets;
+use Illuminate\Broadcasting\PresenceChannel;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Queue\SerializesModels;
+
+class MessageRead implements ShouldBroadcast
+{
+    use InteractsWithSockets, SerializesModels;
+
+    public function __construct(public int $roomId, public int $messageId, public int $userId) {}
+
+    public function broadcastOn(): PresenceChannel { return new PresenceChannel(&#39;chat.&#39; . $this-&gt;roomId); }
+    public function broadcastAs(): string { return &#39;message.read&#39;; }
+    public function broadcastWith(): array { return [&#39;message_id&#39; =&gt; $this-&gt;messageId, &#39;user_id&#39; =&gt; $this-&gt;userId]; }
+}
+</code></pre>
+<h2>Channel Authorization</h2>
+<p>Define who can join a room presence channel in <code>routes/channels.php</code>:</p>
+<pre><code class="language-php">use App\Models\ChatRoom;
+use Illuminate\Support\Facades\Broadcast;
+
+Broadcast::channel(&#39;chat.{roomId}&#39;, function ($user, int $roomId) {
+    return ChatRoom::query()-&gt;whereKey($roomId)-&gt;exists()
+        ? [&#39;id&#39; =&gt; $user-&gt;id, &#39;name&#39; =&gt; $user-&gt;name]
+        : false;
+});
+</code></pre>
+<h2>Controllers and Routes</h2>
+<pre><code class="language-php">// app/Http/Controllers/ChatController.php
+namespace App\Http\Controllers;
+
+use App\Events\MessageRead;
+use App\Events\MessageSent;
+use App\Events\UserTyping;
+use App\Models\ChatMessage;
+use App\Models\ChatRoom;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+
+class ChatController extends Controller
+{
+    public function index()
+    {
+        $rooms = ChatRoom::query()-&gt;orderBy(&#39;name&#39;)-&gt;get();
+        return view(&#39;chat.index&#39;, compact(&#39;rooms&#39;));
+    }
+
+    public function room(ChatRoom $room)
+    {
+        $messages = $room-&gt;messages()-&gt;with(&#39;user&#39;)-&gt;latest()-&gt;limit(50)-&gt;get()-&gt;reverse()-&gt;values();
+        return view(&#39;chat.room&#39;, compact(&#39;room&#39;, &#39;messages&#39;));
+    }
+
+    public function send(Request $request, ChatRoom $room)
+    {
+        $validated = $request-&gt;validate([&#39;body&#39; =&gt; [&#39;required&#39;, &#39;string&#39;, &#39;max:2000&#39;]]);
+        $message = ChatMessage::create([
+            &#39;room_id&#39; =&gt; $room-&gt;id,
+            &#39;user_id&#39; =&gt; Auth::id(),
+            &#39;body&#39; =&gt; $validated[&#39;body&#39;],
+        ]);
+        $message-&gt;load(&#39;user&#39;);
+        broadcast(new MessageSent($message))-&gt;toOthers();
+        return response()-&gt;json([&#39;ok&#39; =&gt; true, &#39;message&#39; =&gt; $message]);
+    }
+
+    public function typing(Request $request, ChatRoom $room)
+    {
+        $validated = $request-&gt;validate([&#39;is_typing&#39; =&gt; [&#39;required&#39;, &#39;boolean&#39;]]);
+        broadcast(new UserTyping($room-&gt;id, Auth::id(), $validated[&#39;is_typing&#39;]))-&gt;toOthers();
+        return response()-&gt;noContent();
+    }
+
+    public function read(Request $request, ChatRoom $room, ChatMessage $message)
+    {
+        if ($message-&gt;room_id !== $room-&gt;id) {
+            abort(404);
+        }
+        $message-&gt;update([&#39;read_at&#39; =&gt; now()]);
+        broadcast(new MessageRead($room-&gt;id, $message-&gt;id, Auth::id()))-&gt;toOthers();
+        return response()-&gt;noContent();
+    }
+}
+</code></pre>
+<pre><code class="language-php">// routes/web.php
+use App\Http\Controllers\ChatController;
+use Illuminate\Support\Facades\Route;
+
+Route::middleware(&#39;auth&#39;)-&gt;group(function () {
+    Route::get(&#39;/chat&#39;, [ChatController::class, &#39;index&#39;])-&gt;name(&#39;chat.index&#39;);
+    Route::get(&#39;/chat/rooms/{room}&#39;, [ChatController::class, &#39;room&#39;])-&gt;name(&#39;chat.room&#39;);
+    Route::post(&#39;/chat/rooms/{room}/send&#39;, [ChatController::class, &#39;send&#39;])-&gt;name(&#39;chat.send&#39;);
+    Route::post(&#39;/chat/rooms/{room}/typing&#39;, [ChatController::class, &#39;typing&#39;])-&gt;name(&#39;chat.typing&#39;);
+    Route::post(&#39;/chat/rooms/{room}/messages/{message}/read&#39;, [ChatController::class, &#39;read&#39;])-&gt;name(&#39;chat.read&#39;);
+});
+</code></pre>
+<h2>Frontend: Laravel Echo + Reverb</h2>
+<p>Install Echo and Pusher protocol client:</p>
+<pre><code class="language-bash">npm install laravel-echo pusher-js
+</code></pre>
+<p>Bootstrap Echo in <code>resources/js/bootstrap.js</code>:</p>
+<pre><code class="language-js">import Echo from &#39;laravel-echo&#39;;
+import Pusher from &#39;pusher-js&#39;;
+
+window.Pusher = Pusher;
+
+window.Echo = new Echo({
+  broadcaster: &#39;reverb&#39;,
+  key: import.meta.env.VITE_REVERB_APP_KEY,
+  wsHost: import.meta.env.VITE_REVERB_HOST ?? window.location.hostname,
+  wsPort: import.meta.env.VITE_REVERB_PORT ?? 8080,
+  wssPort: import.meta.env.VITE_REVERB_PORT ?? 8080,
+  forceTLS: false,
+  enabledTransports: [&#39;ws&#39;, &#39;wss&#39;],
+});
+</code></pre>
+<p>Add Vite env variables in <code>.env</code>:</p>
+<pre><code class="language-env">VITE_REVERB_APP_KEY=${REVERB_APP_KEY}
+VITE_REVERB_HOST=${REVERB_HOST}
+VITE_REVERB_PORT=${REVERB_PORT}
+</code></pre>
+<h3>Blade UI</h3>
+<pre><code class="language-php">// resources/views/chat/room.blade.php
+@extends(&#39;layouts.app&#39;)
+@section(&#39;content&#39;)
+&lt;div class=&quot;container&quot;&gt;
+  &lt;h1 class=&quot;mb-3&quot;&gt;Room: {{ $room-&gt;name }}&lt;/h1&gt;
+  &lt;div id=&quot;messages&quot; class=&quot;border rounded p-3 mb-3&quot; style=&quot;height: 50vh; overflow-y: auto;&quot;&gt;
+    @foreach ($messages as $msg)
+      &lt;div class=&quot;mb-2&quot;&gt;
+        &lt;strong&gt;{{ $msg-&gt;user-&gt;name }}:&lt;/strong&gt;
+        &lt;span&gt;{{ $msg-&gt;body }}&lt;/span&gt;
+        &lt;small class=&quot;text-muted&quot;&gt;{{ $msg-&gt;created_at-&gt;diffForHumans() }}&lt;/small&gt;
+      &lt;/div&gt;
+    @endforeach
+  &lt;/div&gt;
+  &lt;form id=&quot;send-form&quot; class=&quot;d-flex gap-2&quot;&gt;
+    &lt;input type=&quot;text&quot; id=&quot;message-input&quot; class=&quot;form-control&quot; placeholder=&quot;Type a message...&quot; maxlength=&quot;2000&quot; /&gt;
+    &lt;button class=&quot;btn btn-primary&quot; type=&quot;submit&quot;&gt;Send&lt;/button&gt;
+  &lt;/form&gt;
+  &lt;div id=&quot;typing&quot; class=&quot;mt-2 text-muted&quot; style=&quot;min-height:1.5rem&quot;&gt;&lt;/div&gt;
+&lt;/div&gt;
+@endsection
+@push(&#39;scripts&#39;)
+&lt;script type=&quot;module&quot;&gt;
+import &#39;./resources/js/bootstrap.js&#39;;
+
+const roomId = {{ $room-&gt;id }};
+const userId = {{ auth()-&gt;id() }};
+const messagesEl = document.getElementById(&#39;messages&#39;);
+const inputEl = document.getElementById(&#39;message-input&#39;);
+const formEl = document.getElementById(&#39;send-form&#39;);
+const typingEl = document.getElementById(&#39;typing&#39;);
+let typingTimeout = null;
+
+window.Echo.join(`chat.${roomId}`)
+  .here(users =&gt; { /* optionally render online users */ })
+  .joining(user =&gt; { /* show user joined */ })
+  .leaving(user =&gt; { /* show user left */ })
+  .listen(&#39;.message.sent&#39;, (e) =&gt; {
+    const div = document.createElement(&#39;div&#39;);
+    div.className = &#39;mb-2&#39;;
+    div.innerHTML = `&lt;strong&gt;${e.user.name}:&lt;/strong&gt; &lt;span&gt;${e.body}&lt;/span&gt; &lt;small class=&quot;text-muted&quot;&gt;just now&lt;/small&gt;`;
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  })
+  .listen(&#39;.user.typing&#39;, (e) =&gt; {
+    if (e.user_id === userId) return;
+    typingEl.textContent = e.is_typing ? &#39;Someone is typing…&#39; : &#39;&#39;;
+  })
+  .listen(&#39;.message.read&#39;, (e) =&gt; {
+    // Optionally mark message as read in UI
+  });
+
+formEl.addEventListener(&#39;submit&#39;, async (ev) =&gt; {
+  ev.preventDefault();
+  const body = inputEl.value.trim();
+  if (!body) return;
+  await fetch(`{{ route(&#39;chat.send&#39;, $room) }}`, {
+    method: &#39;POST&#39;,
+    headers: { &#39;Content-Type&#39;: &#39;application/json&#39;, &#39;X-CSRF-TOKEN&#39;: &#39;{{ csrf_token() }}&#39; },
+    body: JSON.stringify({ body })
+  });
+  inputEl.value = &#39;&#39;;
+});
+
+inputEl.addEventListener(&#39;input&#39;, async () =&gt; {
+  clearTimeout(typingTimeout);
+  await fetch(`{{ route(&#39;chat.typing&#39;, $room) }}`, {
+    method: &#39;POST&#39;, headers: { &#39;Content-Type&#39;: &#39;application/json&#39;, &#39;X-CSRF-TOKEN&#39;: &#39;{{ csrf_token() }}&#39; },
+    body: JSON.stringify({ is_typing: true })
+  });
+  typingTimeout = setTimeout(async () =&gt; {
+    await fetch(`{{ route(&#39;chat.typing&#39;, $room) }}`, {
+      method: &#39;POST&#39;, headers: { &#39;Content-Type&#39;: &#39;application/json&#39;, &#39;X-CSRF-TOKEN&#39;: &#39;{{ csrf_token() }}&#39; },
+      body: JSON.stringify({ is_typing: false })
+    });
+  }, 1200);
+});
+&lt;/script&gt;
+@endpush
+</code></pre>
+<h2>Running It</h2>
+<ul>
+<li>Start Redis, Reverb, PHP server, and Vite as shown</li>
+<li>Visit <code>/chat/rooms/{id}</code> in two browsers (or incognito) after creating rooms and logging in</li>
+<li>Send messages; they should appear instantly on both clients</li>
+</ul>
+<p>Seeder snippet to create rooms quickly:</p>
+<pre><code class="language-php">// database/seeders/RoomSeeder.php
+public function run(): void { \App\Models\ChatRoom::factory()-&gt;create([&#39;name&#39; =&gt; &#39;General&#39;]); }
+</code></pre>
+<h2>Octane Considerations (Optional for this app)</h2>
+<ul>
+<li>Use Redis for sessions/cache; do not keep request data in singletons</li>
+<li>If you enable Octane, set sensible <code>--max-requests</code> and memory limits, and avoid static state in listeners</li>
+</ul>
+<h2>Troubleshooting</h2>
+<ul>
+<li>Events not received: confirm <code>reverb:start</code> is running, Echo connects (network tab), proper channel name, and <code>BROADCAST_CONNECTION=reverb</code></li>
+<li>403 joins: check <code>routes/channels.php</code> return value and authentication</li>
+<li>Mixed content: if using HTTPS for app but WS is <code>ws://</code>, configure TLS or proxy</li>
+<li>Redis errors: ensure Redis is running and <code>.env</code> uses <code>redis</code> driver for broadcasting backplane</li>
+</ul>
+<h2>Extensions</h2>
+<ul>
+<li>Direct messages (private channels per user pair)</li>
+<li>File attachments</li>
+<li>Message editing and deletion with audit logs</li>
+<li>Message search with Meilisearch/Scout</li>
+</ul>
+<h2>Commit-by-Commit Walkthrough (for students)</h2>
+<ul>
+<li>Commit 1: Project skeleton, Reverb install, <code>.env</code> broadcasting, Redis up</li>
+<li>Commit 2: Migrations for rooms and messages; models with relations</li>
+<li>Commit 3: Events <code>MessageSent</code>, <code>UserTyping</code>, <code>MessageRead</code></li>
+<li>Commit 4: Channel authorization for <code>presence-chat.{roomId}</code></li>
+<li>Commit 5: Controller actions and routes for index/room/send/typing/read</li>
+<li>Commit 6: Frontend dependencies, Echo bootstrap, Vite env</li>
+<li>Commit 7: Blade UI for room with real-time updates</li>
+<li>Commit 8: Seeder, QA notes, troubleshooting, and docs</li>
+</ul>
+<p>Each commit should include a README snippet explaining why the change was needed, trade-offs, and how to test it locally.</p>
+<h2>Diagrams</h2>
+<p><img src="../assets/article-07/chat-architecture.png" alt="Chat architecture"></p>
+<pre><code class="language-mermaid">sequenceDiagram
+  autonumber
+  participant UA as User A (Browser)
+  participant App as Laravel App (HTTP)
+  participant Redis as Redis (Pub/Sub)
+  participant Reverb as Reverb WS Server
+  participant UB as User B (Browser)
+
+  UA-&gt;&gt;App: POST /chat/rooms/{room}/send (body)
+  App-&gt;&gt;App: Persist ChatMessage
+  App--&gt;&gt;Reverb: Broadcast MessageSent(roomId)
+  Reverb--&gt;&gt;UA: .message.sent
+  Reverb--&gt;&gt;UB: .message.sent
+</code></pre></div>
+  </article>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha512-mZ2StmJDLPz7tqP3QGq8cH9K0l3iU3JfVZg6dFfQz0f5TtGP2sFZp3Hf3jQn5vMqQF0z8X5n0n1mV0Vx9gQXhA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script>document.querySelectorAll('pre code').forEach(el => { try { hljs.highlightElement(el); } catch(e){} });</script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    // Transform code blocks with language-mermaid into mermaid divs
+    const blocks = Array.from(document.querySelectorAll('pre code.language-mermaid'));
+    blocks.forEach(code => {
+      const pre = code.parentElement;
+      const container = document.createElement('div');
+      container.className = 'mermaid';
+      container.textContent = code.textContent;
+      pre.replaceWith(container);
+    });
+    mermaid.initialize({ startOnLoad: true, securityLevel: 'loose', theme: 'default' });
+  </script>
+</body>
+</html>

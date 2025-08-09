@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Article 9 — Scaling Your Octane Application: Load Balancing and Multi-Server Setups</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-light.min.css" integrity="sha512-0hNBmqx8uoWaaFWP3QmZqyyw2z4v8pU/3NsKHnqHnJ9tKa5fKvUw3uAHmUsc9IGxKs2gq0v6NQK+mb8UgF4KRg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha512-4p8i7m5Bv71pT6vB6Qz/5mB8j8EgaCm4bI5hJQ4ii7p0N6H7khYCnT2gqF7yNzW3f0F4qGvU1f6aR9pVZpA9aQ==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <style>
+    body { padding: 2rem; display: flex; justify-content: center; }
+    .markdown-body { max-width: 920px; }
+    pre code { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <article class="markdown-body" id="md-root">
+<div><h1>Article 9 — Scaling Your Octane Application: Load Balancing and Multi-Server Setups</h1>
+<p>Outcome: Build a clear, actionable strategy to scale your Octane app horizontally with confidence. Learn load balancer configs, sticky sessions, broadcasting across nodes, and zero-downtime deploys.</p>
+<h2>Scaling Overview</h2>
+<ul>
+<li>Scale up: bigger servers, more CPU/RAM</li>
+<li>Scale out (preferred): multiple app instances behind a load balancer</li>
+<li>Octane specifics: long-lived workers need careful deploy/restart strategies</li>
+</ul>
+<h2>Core Building Blocks</h2>
+<ul>
+<li>Load balancer: Nginx, HAProxy, AWS ALB, GCP LB, Cloudflare</li>
+<li>Shared state: Redis for sessions/cache/queues, S3 for files</li>
+<li>Database: primary + read replicas</li>
+<li>Broadcasting: Reverb with Redis backplane so all nodes receive events</li>
+</ul>
+<h2>Reference Topology</h2>
+<ul>
+<li>Nginx/ALB terminates TLS and balances to N app servers</li>
+<li>Each app server runs Octane (Swoole/RoadRunner) and connects to shared Redis/DB</li>
+<li>Reverb runs collocated or separately; uses Redis for inter-node events</li>
+<li>Queue workers run on the same or dedicated nodes</li>
+</ul>
+<h2>Load Balancer Configs</h2>
+<h3>Nginx (reverse proxy)</h3>
+<pre><code class="language-nginx">upstream app_upstream {
+    server 10.0.1.10:8000 max_fails=3 fail_timeout=30s;
+    server 10.0.1.11:8000 max_fails=3 fail_timeout=30s;
+    keepalive 64;
+}
+
+server {
+    listen 80;
+    server_name example.com;
+
+    location /healthz { return 200 &#39;ok&#39;; add_header Content-Type text/plain; }
+
+    location / {
+        proxy_pass http://app_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+</code></pre>
+<h3>HAProxy (sticky sessions example)</h3>
+<pre><code class="language-haproxy">frontend fe_http
+  bind *:80
+  default_backend be_app
+
+backend be_app
+  balance roundrobin
+  cookie SRV insert indirect nocache
+  server app1 10.0.1.10:8000 check cookie s1
+  server app2 10.0.1.11:8000 check cookie s2
+</code></pre>
+<h2>Octane Service Management</h2>
+<p>Systemd service example:</p>
+<pre><code class="language-ini">[Unit]
+Description=Laravel Octane
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/app
+ExecStart=/usr/bin/php artisan octane:start --server=swoole --workers=8 --task-workers=8 --max-requests=500 --watch
+ExecStop=/usr/bin/php artisan octane:stop
+Restart=always
+RestartSec=5
+Environment=APP_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p>Rolling restarts (zero-downtime):</p>
+<ul>
+<li>Remove instance from LB</li>
+<li><code>systemctl reload octane</code> or stop/start</li>
+<li>Run migrations (if safe)</li>
+<li>Warm caches</li>
+<li>Add back to LB</li>
+<li>Repeat for next instance</li>
+</ul>
+<h2>Sessions and Sticky Sessions</h2>
+<ul>
+<li>Store sessions in Redis</li>
+<li>Prefer stateless auth (tokens) when possible</li>
+<li>If you must use cookies + sessions, sticky sessions at LB level can reduce cross-node misses</li>
+</ul>
+<p><code>.env</code> snippet:</p>
+<pre><code class="language-env">SESSION_DRIVER=redis
+CACHE_STORE=redis
+QUEUE_CONNECTION=redis
+BROADCAST_CONNECTION=reverb
+</code></pre>
+<h2>Broadcasting Across Nodes (Reverb + Redis)</h2>
+<ul>
+<li>Ensure all nodes point to the same Redis for broadcasting</li>
+<li>Use presence/private channels for auth</li>
+<li>Reverb can run on each node; LB can route WS traffic or you can dedicate hosts</li>
+</ul>
+<p>Nginx WS pass-through:</p>
+<pre><code class="language-nginx">location /app/* {
+    proxy_pass http://reverb_upstream;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection &quot;Upgrade&quot;;
+    proxy_set_header Host $host;
+}
+</code></pre>
+<h2>Queues and Background Jobs</h2>
+<ul>
+<li>Run <code>php artisan queue:work</code> on multiple nodes</li>
+<li>Use <code>--max-jobs</code> and <code>--max-time</code> to recycle</li>
+<li>Prefer Horizon for monitoring and balancing</li>
+</ul>
+<p>Horizon snippet (supervisor):</p>
+<pre><code class="language-ini">[program:horizon]
+command=php artisan horizon
+numprocs=1
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/horizon.out.log
+stderr_logfile=/var/log/horizon.err.log
+</code></pre>
+<h2>Database Scaling</h2>
+<ul>
+<li>Read replicas for reporting/feeds; use <code>-&gt;useReadPdo()</code> or read/write connections</li>
+<li>Migrate carefully; prefer backward-compatible schema changes</li>
+<li>Add indexes as traffic grows; measure via slow query logs</li>
+</ul>
+<h2>File Storage</h2>
+<ul>
+<li>Use S3 or compatible blob storage for user uploads</li>
+<li>Serve via CDN; never depend on local disk sharing across instances</li>
+</ul>
+<h2>Health Checks and Readiness</h2>
+<ul>
+<li><code>/healthz</code> endpoint returns 200 and optionally checks Redis/DB</li>
+<li>LB removes failing nodes automatically</li>
+<li>Use connection draining before shutdown</li>
+</ul>
+<h2>Observability</h2>
+<ul>
+<li>Centralized logs (ELK, Loki)</li>
+<li>Metrics (Prometheus/Grafana, CloudWatch) for request rate, errors, latency, memory, CPU</li>
+<li>Tracing (OpenTelemetry) to analyze cross-service performance</li>
+</ul>
+<h2>Docker/Kubernetes Notes</h2>
+<ul>
+<li>Docker: one container per process (app, horizon, reverb). Compose example:</li>
+</ul>
+<pre><code class="language-yaml">version: &#39;3.8&#39;
+services:
+  app:
+    build: .
+    command: php artisan octane:start --server=swoole --host=0.0.0.0 --port=8000 --workers=8 --task-workers=8 --max-requests=500
+    ports: [&quot;8000:8000&quot;]
+    env_file: .env
+    depends_on: [redis, db]
+  reverb:
+    build: .
+    command: php artisan reverb:start --host=0.0.0.0 --port=8080
+    ports: [&quot;8080:8080&quot;]
+    env_file: .env
+    depends_on: [redis]
+  redis:
+    image: redis:7-alpine
+    ports: [&quot;6379:6379&quot;]
+  db:
+    image: mysql:8
+    environment:
+      MYSQL_DATABASE: app
+      MYSQL_ROOT_PASSWORD: secret
+    ports: [&quot;3306:3306&quot;]
+</code></pre>
+<ul>
+<li>Kubernetes: use Deployments with rolling updates; readiness/liveness probes; ConfigMaps/Secrets for env; Services for app and Reverb; HPA for scaling</li>
+</ul>
+<h2>Runbooks</h2>
+<ul>
+<li>Scale out: add node, register with LB, deploy, warm, add to rotation</li>
+<li>Incident: spike in latency → check DB/Redis saturation → scale horizontally → increase workers temporarily</li>
+<li>WebSockets outage: verify Reverb health and Redis connectivity</li>
+</ul>
+<h2>Cost and Performance Tips</h2>
+<ul>
+<li>Tune <code>workers</code> and <code>task-workers</code> to CPU cores</li>
+<li>Set <code>--max-requests</code> to recycle workers and cap memory growth</li>
+<li>Cache config/routes/views; preload frequent data if safe</li>
+</ul>
+<h2>Commit-by-Commit Teaching Plan</h2>
+<ul>
+<li>Commit 1: Introduce Nginx or ALB config; add health checks</li>
+<li>Commit 2: Move sessions/cache/queue to Redis; document reasons</li>
+<li>Commit 3: Add Reverb with Redis backplane, WS proxy config</li>
+<li>Commit 4: Add Supervisor/systemd units for Octane/Horizon; rolling restart procedure</li>
+<li>Commit 5: Add Docker Compose (and optional K8s notes) for local multi-instance testing</li>
+<li>Commit 6: Add observability dashboard pointers and SLOs</li>
+</ul>
+<p>Each commit should include verification steps: how to test LB routing, sticky sessions, broadcast across two nodes, and zero-downtime rollout.</p>
+<h2>Diagrams</h2>
+<p><img src="../assets/article-09/topology.png" alt="Scaling topology"></p>
+<pre><code class="language-mermaid">graph LR
+  LB[Load Balancer / Ingress] --&gt; APP1[App Node 1: Octane]
+  LB --&gt; APP2[App Node 2: Octane]
+  LB --&gt; APP3[App Node 3: Octane]
+
+  subgraph Shared Services
+    REDIS[(Redis)]
+    DB[(Primary + Replicas)]
+    S3[(Object Storage)]
+    REVERB[Reverb Cluster]
+  end
+
+  APP1 --- REDIS
+  APP2 --- REDIS
+  APP3 --- REDIS
+
+  APP1 --- DB
+  APP2 --- DB
+  APP3 --- DB
+
+  APP1 --- REVERB
+  APP2 --- REVERB
+  APP3 --- REVERB
+
+  APP1 --- S3
+  APP2 --- S3
+  APP3 --- S3
+</code></pre></div>
+  </article>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha512-mZ2StmJDLPz7tqP3QGq8cH9K0l3iU3JfVZg6dFfQz0f5TtGP2sFZp3Hf3jQn5vMqQF0z8X5n0n1mV0Vx9gQXhA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script>document.querySelectorAll('pre code').forEach(el => { try { hljs.highlightElement(el); } catch(e){} });</script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    // Transform code blocks with language-mermaid into mermaid divs
+    const blocks = Array.from(document.querySelectorAll('pre code.language-mermaid'));
+    blocks.forEach(code => {
+      const pre = code.parentElement;
+      const container = document.createElement('div');
+      container.className = 'mermaid';
+      container.textContent = code.textContent;
+      pre.replaceWith(container);
+    });
+    mermaid.initialize({ startOnLoad: true, securityLevel: 'loose', theme: 'default' });
+  </script>
+</body>
+</html>
